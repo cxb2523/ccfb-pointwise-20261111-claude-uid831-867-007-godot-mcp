@@ -14,7 +14,7 @@ const ALL_TOOL_NAMES = [
   'game_eval', 'game_get_property', 'game_set_property', 'game_call_method',
   'game_get_node_info', 'game_instantiate_scene', 'game_remove_node',
   'game_change_scene', 'game_pause', 'game_performance', 'game_wait',
-  'read_scene', 'modify_scene_node', 'remove_scene_node',
+  'read_scene', 'get_scene_tree', 'modify_scene_node', 'remove_scene_node',
   'read_project_settings', 'modify_project_settings', 'list_project_files',
   'game_connect_signal', 'game_disconnect_signal', 'game_emit_signal',
   'game_play_animation', 'game_tween_property', 'game_get_nodes_in_group',
@@ -71,8 +71,8 @@ beforeAll(() => {
 });
 
 describe('Tool definitions', () => {
-  it('defines exactly 157 tools', () => {
-    expect(ALL_TOOL_NAMES).toHaveLength(157);
+  it('defines exactly 158 tools', () => {
+    expect(ALL_TOOL_NAMES).toHaveLength(158);
   });
 
   it('all tool names are unique', () => {

@@ -87,7 +87,7 @@ describe('MCP filesystem boundaries', () => {
 
   it('provides items for every array in every advertised schema', async () => {
     const { tools } = await client.listTools();
-    expect(tools).toHaveLength(157);
+    expect(tools).toHaveLength(158);
     function visit(schema: any) {
       if (!schema || typeof schema !== 'object') return;
       if (schema.type === 'array') expect(schema.items).toBeDefined();

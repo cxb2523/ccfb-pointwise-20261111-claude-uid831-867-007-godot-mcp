@@ -23,7 +23,7 @@ it('initializes the stdio server when its executable is reached through a direct
   try {
     await client.connect(transport);
     const { tools } = await client.listTools();
-    expect(tools).toHaveLength(157);
+    expect(tools).toHaveLength(158);
     expect(tools.some(tool => tool.name === 'read_file')).toBe(true);
   } finally {
     await client.close();

@@ -5,6 +5,12 @@ extends SceneTree
 # Debug mode flag
 var debug_mode = false
 
+# get_scene_tree: marker placed inside a children array when a subtree is cut
+# off at the depth boundary. Markers consume the same output budget as real nodes.
+const GET_SCENE_TREE_MARKER := "__truncated__"
+const GET_SCENE_TREE_DEFAULT_MAX_DEPTH := 32
+const GET_SCENE_TREE_DEFAULT_MAX_NODES := 1000
+
 func _init():
     var args = OS.get_cmdline_args()
     
@@ -90,6 +96,8 @@ func _init():
             manage_theme_resource(params)
         "manage_scene_structure":
             manage_scene_structure(params)
+        "get_scene_tree":
+            get_scene_tree(params)
         _:
             log_error("Unknown operation: " + operation)
             quit(1)
@@ -1885,3 +1893,233 @@ func _is_ancestor(node, maybe_descendant):
             return true
         n = n.get_parent()
     return false
+
+
+# ===========================================================================
+# get_scene_tree
+#
+# Bounded, depth-first scene tree walk. Depth and total node count share one
+# output budget: every emitted real node AND every truncation marker consumes a
+# slot. This keeps the returned payload (and therefore the MCP channel) bounded
+# regardless of how wide or deep the scene is.
+#
+# Output contract:
+#   - node objects keep only name/type/path/children; visible and process_mode
+#     are attached only when the node's OWN stored value is non-default (we do
+#     not resolve inherited/effective state, so a hidden ancestor never causes
+#     repeated fields down the branch).
+#   - depth boundary: a marker is reserved in the parent's children array
+#     before descending is cut, so the marker can displace not-yet-visited
+#     siblings once the budget is tight.
+#   - count exhaustion: the root -> current branch path is always fully
+#     materialised first; details live on the parent's "truncated" object
+#     (depth/level plus the dropped branch paths), never a top-level boolean.
+# ===========================================================================
+func get_scene_tree(params):
+    print("GET_SCENE_TREE_JSON_START")
+    var envelope = _get_scene_tree_build(params)
+    print(JSON.stringify(envelope))
+    print("GET_SCENE_TREE_JSON_END")
+
+func _get_scene_tree_build(params) -> Dictionary:
+    if not params.has("scene_path"):
+        return _get_scene_tree_error("INVALID_PARAMS", "scene_path is required")
+
+    var full_scene_path = params.scene_path
+    if not full_scene_path.begins_with("res://"):
+        full_scene_path = "res://" + full_scene_path
+
+    log_info("get_scene_tree: " + full_scene_path)
+
+    if not FileAccess.file_exists(full_scene_path):
+        # Editor has no such/openable scene at this path.
+        return _get_scene_tree_error("NO_SCENE", "Scene not found: " + full_scene_path)
+
+    var scene = load(full_scene_path)
+    if not scene is PackedScene:
+        return _get_scene_tree_error("NO_SCENE", "Failed to load scene: " + full_scene_path)
+
+    var scene_root = scene.instantiate()
+    if scene_root == null:
+        return _get_scene_tree_error("NO_SCENE", "Failed to instantiate scene: " + full_scene_path)
+
+    # Clamp the shared budget to sane, positive values. Markers count too.
+    var max_depth = int(params.get("max_depth", GET_SCENE_TREE_DEFAULT_MAX_DEPTH))
+    if max_depth < 1:
+        max_depth = 1
+    var max_nodes = int(params.get("max_nodes", GET_SCENE_TREE_DEFAULT_MAX_NODES))
+    if max_nodes < 1:
+        max_nodes = 1
+
+    var state := {
+        "budget": max_nodes,
+        "used": 0,
+        "max_depth": max_depth,
+        "truncated": false,
+    }
+
+    var root_obj: Dictionary = _get_scene_tree_walk(scene_root, "root", 0, state)
+
+    scene_root.queue_free()
+
+    return {
+        "success": true,
+        "data": {
+            "tree": root_obj,
+            "limits": {
+                "max_depth": max_depth,
+                "max_nodes": max_nodes,
+            },
+            "used": state["used"],
+            "truncated": state["truncated"],
+        },
+    }
+
+func _get_scene_tree_error(code: String, message: String) -> Dictionary:
+    return {
+        "success": false,
+        "error": {
+            "code": code,
+            "message": message,
+        },
+        "data": null,
+    }
+
+# Reserve one slot of the shared budget. Returns false once the budget is gone.
+func _get_scene_tree_reserve(state: Dictionary) -> bool:
+    if state["used"] >= state["budget"]:
+        state["truncated"] = true
+        return false
+    state["used"] += 1
+    return true
+
+func _get_scene_tree_marker(reason: String, depth: int, parent_path: String) -> Dictionary:
+    return {
+        "marker": GET_SCENE_TREE_MARKER,
+        "reason": reason,
+        "depth": depth,
+        "parent_path": parent_path,
+    }
+
+# Iterative DFS. Each frame carries the node, its own path, its depth (root = 0),
+# the output object already accounting for that node, and the index of the next
+# child to inspect. Parent frames stay on the stack so the root -> current path
+# is materialised before any sibling subtree is attempted.
+func _get_scene_tree_walk(root: Node, root_path: String, root_depth: int, state: Dictionary) -> Dictionary:
+    var root_obj := _get_scene_tree_node_info(root, root_path)
+    if not _get_scene_tree_reserve(state):
+        # Budget cannot even hold the root; report it without children.
+        root_obj["truncated"] = _get_scene_tree_truncated(
+            root_depth + 1, root_obj["path"], [], "node_limit")
+        return root_obj
+
+    var stack: Array = [{
+        "node": root,
+        "obj": root_obj,
+        "path": root_obj["path"],
+        "depth": root_depth,
+        "next": 0,
+    }]
+
+    while stack.size() > 0:
+        var frame: Dictionary = stack[stack.size() - 1]
+        var node: Node = frame["node"]
+        var obj: Dictionary = frame["obj"]
+        var depth: int = frame["depth"]
+        var children: Array = node.get_children()
+
+        # Depth boundary: this node sits at max_depth, so every child would be
+        # past it. Reserve ONE marker in this node's children BEFORE cutting the
+        # descent; the marker takes a budget slot and can therefore starve
+        # sibling subtrees elsewhere in the DFS. Every out-of-bounds child is
+        # listed as a dropped branch on the parent's truncated descriptor.
+        if depth >= state["max_depth"]:
+            if children.size() > 0:
+                state["truncated"] = true
+                var boundary_arr: Array = obj.get("children", [])
+                obj["children"] = boundary_arr
+                var marker_added: bool = _get_scene_tree_reserve(state)
+                var reason: String = "depth_limit" if marker_added else "node_limit"
+                if marker_added:
+                    boundary_arr.append(_get_scene_tree_marker("depth_limit", depth + 1, frame["path"]))
+                for cut_child in children:
+                    _get_scene_tree_note_truncation(
+                        obj, depth + 1, frame["path"] + "/" + str(cut_child.name), reason)
+            stack.pop_back()
+            continue
+
+        if frame["next"] >= children.size():
+            stack.pop_back()
+            continue
+
+        var child: Node = children[frame["next"]]
+        frame["next"] += 1
+
+        var child_path: String = frame["path"] + "/" + str(child.name)
+        var child_depth: int = depth + 1
+        var child_arr: Array = obj.get("children", [])
+        obj["children"] = child_arr
+
+        if not _get_scene_tree_reserve(state):
+            # Total budget exhausted while this branch is still continuous:
+            # record the dropped branch on the parent instead of emitting a
+            # partial node.
+            state["truncated"] = true
+            _get_scene_tree_note_truncation(obj, child_depth, child_path, "node_limit")
+            continue
+
+        var child_obj := _get_scene_tree_node_info(child, child_path)
+        child_arr.append(child_obj)
+        stack.append({
+            "node": child,
+            "obj": child_obj,
+            "path": child_path,
+            "depth": child_depth,
+            "next": 0,
+        })
+
+    return root_obj
+
+# Attach (or merge) a parent-level truncation descriptor. This is the detailed
+# replacement for a bare top-level boolean: it names the level/depth and every
+# branch that was dropped underneath this node.
+func _get_scene_tree_note_truncation(parent_obj: Dictionary, level: int, branch_path: String, reason: String) -> void:
+    var truncated: Dictionary = parent_obj.get("truncated", {})
+    if truncated.is_empty():
+        truncated = _get_scene_tree_truncated(level, parent_obj["path"], [], reason)
+        parent_obj["truncated"] = truncated
+    truncated["dropped_branches"].append(branch_path)
+    if not (reason in truncated["reasons"]):
+        truncated["reasons"].append(reason)
+
+func _get_scene_tree_truncated(level: int, parent_path: String, dropped_branches: Array, reason: String) -> Dictionary:
+    return {
+        "depth": level,
+        "level": level,
+        "at": parent_path,
+        "reasons": [reason],
+        "dropped_branches": dropped_branches,
+    }
+
+func _get_scene_tree_node_info(node: Node, node_path: String) -> Dictionary:
+    var info := {
+        "name": str(node.name),
+        "type": node.get_class(),
+        "path": node_path,
+        "children": [],
+    }
+
+    # Own stored visibility only: CanvasItem.visible defaults to true. Base
+    # Node has no visible property, so guard on CanvasItem. We never read
+    # is_visible_in_tree(), so an invisible ancestor does not repeat the field
+    # on every descendant.
+    if node is CanvasItem and not node.visible:
+        info["visible"] = false
+
+    # Own stored process mode only: PROCESS_MODE_INHERIT (0) is the default and
+    # means "derive from parent", so it is omitted rather than expanded.
+    var own_process_mode: int = node.process_mode
+    if own_process_mode != Node.PROCESS_MODE_INHERIT:
+        info["process_mode"] = own_process_mode
+
+    return info

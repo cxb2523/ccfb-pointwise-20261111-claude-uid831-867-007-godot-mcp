@@ -8,7 +8,7 @@
 [![](https://img.shields.io/badge/TypeScript-3178C6?style=flat&logo=typescript&logoColor=white 'TypeScript')](https://www.typescriptlang.org/)
 [![](https://img.shields.io/badge/License-MIT-red.svg 'MIT License')](https://opensource.org/licenses/MIT)
 
-A comprehensive [Model Context Protocol](https://modelcontextprotocol.io/introduction) (MCP) server that gives AI assistants **full control** over the Godot game engine. **157 tools** spanning networking, 3D/2D rendering, UI controls, audio effects, animation trees, file I/O, runtime code execution, property inspection, scene manipulation, signal management, physics, project creation, and more.
+A comprehensive [Model Context Protocol](https://modelcontextprotocol.io/introduction) (MCP) server that gives AI assistants **full control** over the Godot game engine. **158 tools** spanning networking, 3D/2D rendering, UI controls, audio effects, animation trees, file I/O, runtime code execution, property inspection, scene manipulation, signal management, physics, project creation, and more.
 
 ## Acknowledgments
 
@@ -16,7 +16,7 @@ This project is built upon and extends [godot-mcp](https://github.com/Coding-Sol
 
 ## What's New (Improvements Over Original)
 
-The original godot-mcp provided 20 tools for basic project management and scene creation. This fork extends it to **157 tools** with the following major additions:
+The original godot-mcp provided 20 tools for basic project management and scene creation. This fork extends it to **158 tools** with the following major additions:
 
 ### New in 3.1
 - **`validate_script` autoload resolution** - Script validation now compiles the target through a `SceneTree` at `_initialize()` (after project autoloads are registered) instead of `--check-only` at `_init()`. References to autoload singletons no longer produce false `Identifier not found` errors, while real syntax/type errors are still caught. Verified building a full game whose scripts reference several autoloads.
@@ -59,6 +59,7 @@ The original godot-mcp provided 20 tools for basic project management and scene 
 
 ### Headless Scene Operations (No Running Game Needed)
 - **`read_scene`** - Parse any .tscn file and get full node tree with properties as JSON
+- **`get_scene_tree`** - Bounded scene tree (shared depth/node budget, truncation markers) as a structured envelope
 - **`modify_scene_node`** - Change node properties in scene files
 - **`remove_scene_node`** - Remove nodes from scene files
 - **`attach_script`** - Attach GDScript files to nodes in scenes
@@ -215,7 +216,7 @@ The original godot-mcp provided 20 tools for basic project management and scene 
 - **PackedArray serialization** - Proper JSON arrays instead of string fallback
 - **Graceful error handling** - Scene read fallback to raw .tscn text on missing dependencies
 
-## All 157 Tools
+## All 158 Tools
 
 ### Project Management (7 tools)
 | Tool | Description |
@@ -239,10 +240,11 @@ The original godot-mcp provided 20 tools for basic project management and scene 
 | `get_uid` | Get UID for a file (Godot 4.4+) |
 | `update_project_uids` | Resave resources to update UIDs |
 
-### Headless Scene Operations (5 tools)
+### Headless Scene Operations (6 tools)
 | Tool | Description |
 |------|-------------|
 | `read_scene` | Read full scene tree as JSON |
+| `get_scene_tree` | Bounded scene tree with shared depth/node budget and truncation markers |
 | `modify_scene_node` | Modify node properties in a scene file |
 | `remove_scene_node` | Remove a node from a scene file |
 | `attach_script` | Attach a GDScript to a scene node |
@@ -681,4 +683,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Credits
 
 - **Original project**: [godot-mcp](https://github.com/Coding-Solo/godot-mcp) by [Solomon Elias (Coding-Solo)](https://github.com/Coding-Solo) - provided the foundational MCP server architecture, headless operations system, and TCP interaction framework
-- **Extended by**: [Tugcan Topaloglu](https://github.com/tugcantopaloglu) - extended to 157 tools covering networking, 3D/2D rendering, UI controls, audio effects, animation trees, file I/O, runtime code execution, node manipulation, signals, project creation, camera control, physics, and comprehensive type conversion
+- **Extended by**: [Tugcan Topaloglu](https://github.com/tugcantopaloglu) - extended to 158 tools covering networking, 3D/2D rendering, UI controls, audio effects, animation trees, file I/O, runtime code execution, node manipulation, signals, project creation, camera control, physics, and comprehensive type conversion

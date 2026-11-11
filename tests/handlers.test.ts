@@ -10,9 +10,10 @@
  *      tests that simulate what each handler does with its arguments.
  */
 
-import { describe, it, expect, beforeAll } from 'vitest';
-import { readFileSync, existsSync } from 'fs';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import { readFileSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
 import { join, dirname } from 'path';
+import { tmpdir } from 'os';
 import { fileURLToPath } from 'url';
 import {
   normalizeParameters,
@@ -20,6 +21,7 @@ import {
   validatePath,
   createErrorResponse,
 } from '../src/utils.js';
+import { GodotServer } from '../src/index.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -1932,8 +1934,8 @@ describe('Tool dispatch switch statement', () => {
   it('every case returns await this.handle*', () => {
     const caseRegex = /case '(\w+)':\s*\n\s*return await this\.handle/g;
     const matches = [...sourceCode.matchAll(caseRegex)];
-    // Should match all 157 tools
-    expect(matches.length).toBe(157);
+    // Should match all 158 tools
+    expect(matches.length).toBe(158);
   });
 
   it('no case falls through without return', () => {
@@ -1945,5 +1947,354 @@ describe('Tool dispatch switch statement', () => {
     const caseStatements = switchBlock.match(/case '[^']+'/g) || [];
     const returnStatements = switchBlock.match(/return await/g) || [];
     expect(returnStatements.length).toBe(caseStatements.length);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 11. get_scene_tree — bounded DFS semantics
+//
+// The traversal lives in GDScript (godot_operations.gd) and cannot run under
+// Node. The following walkSceneTree() is a faithful, line-for-line port of the
+// GDScript iterative DFS operating on mock nodes, so the budget/marker
+// semantics are exercised against the same algorithm the engine runs.
+// ---------------------------------------------------------------------------
+interface MockNode {
+  name: string;
+  type: string;
+  visible?: boolean;    // Node.visible default (true) when omitted
+  processMode?: number; // Node.PROCESS_MODE_INHERIT (0) when omitted
+  children: MockNode[];
+}
+
+const SCENE_TREE_MARKER = '__truncated__';
+
+function walkSceneTree(root: MockNode, limits: { maxDepth: number; maxNodes: number }): any {
+  const state = { budget: limits.maxNodes, used: 0, maxDepth: limits.maxDepth, truncated: false };
+
+  const reserve = (): boolean => {
+    if (state.used >= state.budget) {
+      state.truncated = true;
+      return false;
+    }
+    state.used += 1;
+    return true;
+  };
+  const marker = (reason: string, depth: number, parentPath: string) =>
+    ({ marker: SCENE_TREE_MARKER, reason, depth, parent_path: parentPath });
+  const makeTruncated = (level: number, parentPath: string, reason: string) =>
+    ({ depth: level, level, at: parentPath, reasons: [reason], dropped_branches: [] as string[] });
+  const noteTruncation = (parentObj: any, level: number, branchPath: string, reason: string) => {
+    if (!parentObj.truncated) parentObj.truncated = makeTruncated(level, parentObj.path, reason);
+    parentObj.truncated.dropped_branches.push(branchPath);
+    if (!parentObj.truncated.reasons.includes(reason)) parentObj.truncated.reasons.push(reason);
+  };
+  const nodeInfo = (node: MockNode, path: string) => {
+    const info: any = { name: node.name, type: node.type, path, children: [] };
+    if (node.visible === false) info.visible = false;
+    if (node.processMode !== undefined && node.processMode !== 0) info.process_mode = node.processMode;
+    return info;
+  };
+
+  const rootObj = nodeInfo(root, 'root');
+  if (!reserve()) {
+    rootObj.truncated = makeTruncated(1, rootObj.path, 'node_limit');
+    return { tree: rootObj, state };
+  }
+
+  const stack: any[] = [{ node: root, obj: rootObj, path: rootObj.path, depth: 0, next: 0 }];
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1];
+    const node: MockNode = frame.node;
+    const obj: any = frame.obj;
+
+    if (frame.depth >= state.maxDepth) {
+      if (node.children.length > 0) {
+        state.truncated = true;
+        const markerAdded = reserve();
+        const reason = markerAdded ? 'depth_limit' : 'node_limit';
+        if (markerAdded) obj.children.push(marker('depth_limit', frame.depth + 1, frame.path));
+        for (const cutChild of node.children) {
+          noteTruncation(obj, frame.depth + 1, frame.path + '/' + cutChild.name, reason);
+        }
+      }
+      stack.pop();
+      continue;
+    }
+
+    if (frame.next >= node.children.length) {
+      stack.pop();
+      continue;
+    }
+
+    const child = node.children[frame.next++];
+    const childPath = frame.path + '/' + child.name;
+    const childDepth = frame.depth + 1;
+
+    if (!reserve()) {
+      state.truncated = true;
+      noteTruncation(obj, childDepth, childPath, 'node_limit');
+      continue;
+    }
+
+    const childObj = nodeInfo(child, childPath);
+    obj.children.push(childObj);
+    stack.push({ node: child, obj: childObj, path: childPath, depth: childDepth, next: 0 });
+  }
+
+  return { tree: rootObj, state };
+}
+
+function collectRealNodes(obj: any, acc: any[] = []): any[] {
+  if (!obj || obj.marker === SCENE_TREE_MARKER) return acc;
+  acc.push(obj);
+  for (const child of obj.children || []) collectRealNodes(child, acc);
+  return acc;
+}
+
+function collectMarkers(obj: any, acc: any[] = []): any[] {
+  if (!obj) return acc;
+  if (obj.marker === SCENE_TREE_MARKER) {
+    acc.push(obj);
+    return acc;
+  }
+  for (const child of obj.children || []) collectMarkers(child, acc);
+  return acc;
+}
+
+describe('get_scene_tree — bounded DFS (GDScript algorithm port)', () => {
+  it('emits normal nesting with stable fields and omits default visible/process_mode', () => {
+    const tree: MockNode = {
+      name: 'Main', type: 'Node2D', children: [
+        { name: 'Plain', type: 'Node', children: [] },
+        { name: 'Hidden', type: 'Control', visible: false, children: [] },
+        { name: 'Paused', type: 'Node', processMode: 3, children: [] },
+      ],
+    };
+    const { tree: out, state } = walkSceneTree(tree, { maxDepth: 32, maxNodes: 1000 });
+
+    expect(state.truncated).toBe(false);
+    expect(state.used).toBe(4);
+    expect(Object.keys(out).sort()).toEqual(['children', 'name', 'path', 'type']);
+    expect(out.path).toBe('root');
+
+    const [plain, hidden, paused] = out.children;
+    expect(plain.path).toBe('root/Plain');
+    expect(plain.visible).toBeUndefined();
+    expect(plain.process_mode).toBeUndefined();
+    expect(hidden.visible).toBe(false);
+    expect(hidden.process_mode).toBeUndefined();
+    expect(paused.process_mode).toBe(3);
+    expect(paused.visible).toBeUndefined();
+  });
+
+  it('depth marker is reserved first and consumes budget that displaces an unvisited sibling', () => {
+    // maxDepth 1: root(0) -> A,B(1). A has child A1(2, past the boundary).
+    // Budget 3 = root + A + the depth marker. Sibling B then has no slot.
+    const tree: MockNode = {
+      name: 'Root', type: 'Node', children: [
+        { name: 'A', type: 'Node', children: [{ name: 'A1', type: 'Node', children: [] }] },
+        { name: 'B', type: 'Node', children: [] },
+      ],
+    };
+    const { tree: out, state } = walkSceneTree(tree, { maxDepth: 1, maxNodes: 3 });
+
+    expect(state.used).toBe(3); // root + A + marker (markers count)
+    expect(state.truncated).toBe(true);
+
+    const a = out.children.find((c: any) => c.name === 'A');
+    const markers = collectMarkers(out);
+    expect(markers).toHaveLength(1);
+    expect(markers[0].reason).toBe('depth_limit');
+    expect(markers[0].depth).toBe(2);
+    expect(markers[0].parent_path).toBe('root/A');
+    expect(a.children.map((c: any) => c.marker)).toContain(SCENE_TREE_MARKER);
+
+    // The marker starved sibling B: B is not emitted but is named as dropped.
+    expect(out.children.map((c: any) => c.name)).toEqual(['A']);
+    expect(out.truncated.dropped_branches).toContain('root/B');
+    expect(out.truncated.reasons).toContain('node_limit');
+    // The boundary parent records the cut subtree with its depth/level.
+    expect(a.truncated.depth).toBe(2);
+    expect(a.truncated.level).toBe(2);
+    expect(a.truncated.dropped_branches).toContain('root/A/A1');
+  });
+
+  it('total-node exhaustion keeps the root-to-current path continuous and details the cut', () => {
+    const chain: MockNode = {
+      name: 'R', type: 'Node', children: [{
+        name: 'a', type: 'Node', children: [{
+          name: 'b', type: 'Node', children: [{
+            name: 'c', type: 'Node', children: [{ name: 'd', type: 'Node', children: [] }],
+          }],
+        }],
+      }],
+    };
+    const { tree: out, state } = walkSceneTree(chain, { maxDepth: 32, maxNodes: 3 });
+
+    expect(state.used).toBe(3);
+    expect(collectMarkers(out)).toHaveLength(0); // count cuts add no marker
+
+    const paths = collectRealNodes(out).map(n => n.path);
+    expect(paths).toEqual(['root', 'root/a', 'root/a/b']);
+    // Every non-root path prefix is a materialised node (continuous path).
+    for (const p of paths.filter(p => p.includes('/'))) {
+      const prefix = p.substring(0, p.lastIndexOf('/'));
+      expect(paths).toContain(prefix === '' ? 'root' : prefix);
+    }
+
+    const deepest = collectRealNodes(out).find(n => n.path === 'root/a/b')!;
+    expect(deepest.truncated).toBeDefined();
+    expect(deepest.truncated.depth).toBe(3);
+    expect(deepest.truncated.level).toBe(3);
+    expect(deepest.truncated.at).toBe('root/a/b');
+    expect(deepest.truncated.reasons).toEqual(['node_limit']);
+    expect(deepest.truncated.dropped_branches).toEqual(['root/a/b/c']);
+  });
+
+  it('never emits more real nodes plus markers than the shared budget', () => {
+    const wide: MockNode = {
+      name: 'R', type: 'Node',
+      children: Array.from({ length: 50 }, (_, i) => ({
+        name: `n${i}`, type: 'Node',
+        children: [{ name: 'deep', type: 'Node', children: [] }],
+      })),
+    };
+    const { tree: out, state } = walkSceneTree(wide, { maxDepth: 2, maxNodes: 20 });
+    const realCount = collectRealNodes(out).length;
+    const markerCount = collectMarkers(out).length;
+    expect(realCount + markerCount).toBe(state.used);
+    expect(state.used).toBeLessThanOrEqual(20);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 12. get_scene_tree — handler envelope handling with a mocked Godot connection
+// ---------------------------------------------------------------------------
+describe('handleGetSceneTree — structured envelope over mocked connection', () => {
+  const gdSource = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'scripts', 'godot_operations.gd'),
+    'utf8'
+  );
+  let workspace: string;
+  let projectPath: string;
+  let server: any;
+  let executeOp: ReturnType<typeof vi.fn>;
+  let sigintListeners: NodeJS.SignalsListener[];
+
+  beforeAll(() => {
+    workspace = mkdtempSync(join(tmpdir(), 'godot-scene-tree-'));
+    projectPath = join(workspace, 'project');
+    mkdirSync(projectPath, { recursive: true });
+    writeFileSync(join(projectPath, 'project.godot'), 'config_version=5\n');
+    writeFileSync(join(projectPath, 'main.tscn'), '[gd_scene]\n');
+
+    sigintListeners = process.listeners('SIGINT') as NodeJS.SignalsListener[];
+    server = new GodotServer();
+    executeOp = vi.fn();
+    server.executeOperation = executeOp;
+  });
+
+  afterAll(async () => {
+    await server.server.close();
+    for (const listener of process.listeners('SIGINT') as NodeJS.SignalsListener[]) {
+      if (!sigintListeners.includes(listener)) process.removeListener('SIGINT', listener);
+    }
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  function stdoutWith(payload: any): string {
+    return `GET_SCENE_TREE_JSON_START\n${JSON.stringify(payload)}\nGET_SCENE_TREE_JSON_END`;
+  }
+
+  const successEnvelope = {
+    success: true,
+    data: {
+      tree: { name: 'Main', type: 'Node2D', path: 'root', children: [] },
+      limits: { max_depth: 32, max_nodes: 1000 },
+      used: 1,
+      truncated: false,
+    },
+  };
+
+  it('returns the parsed success envelope and forwards the operation name/budget', async () => {
+    executeOp.mockResolvedValue({ stdout: stdoutWith(successEnvelope), stderr: '' });
+    const res = await server.handleGetSceneTree({
+      projectPath, scenePath: 'main.tscn', maxDepth: 4, maxNodes: 50,
+    });
+
+    expect(executeOp).toHaveBeenCalledWith(
+      'get_scene_tree',
+      { scenePath: 'main.tscn', maxDepth: 4, maxNodes: 50 },
+      projectPath
+    );
+    expect(res.isError).toBe(false);
+    const parsed = JSON.parse(res.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.data.tree.path).toBe('root');
+  });
+
+  it('wraps an engine NO_SCENE envelope without throwing', async () => {
+    executeOp.mockResolvedValue({
+      stdout: stdoutWith({ success: false, error: { code: 'NO_SCENE', message: 'Scene not found' }, data: null }),
+      stderr: '',
+    });
+    const res = await server.handleGetSceneTree({ projectPath, scenePath: 'main.tscn' });
+    expect(res.isError).toBe(true);
+    const parsed = JSON.parse(res.content[0].text);
+    expect(parsed.success).toBe(false);
+    expect(parsed.error.code).toBe('NO_SCENE');
+  });
+
+  it('maps a disconnected/failed spawn to a DISCONNECTED envelope', async () => {
+    executeOp.mockRejectedValueOnce(new Error('spawn ENOENT'));
+    const res = await server.handleGetSceneTree({ projectPath, scenePath: 'main.tscn' });
+    expect(res.isError).toBe(true);
+    const parsed = JSON.parse(res.content[0].text);
+    expect(parsed.error.code).toBe('DISCONNECTED');
+  });
+
+  it('maps missing response markers (plugin silent/closed) to DISCONNECTED', async () => {
+    executeOp.mockResolvedValue({ stdout: 'nothing useful here', stderr: '' });
+    const res = await server.handleGetSceneTree({ projectPath, scenePath: 'main.tscn' });
+    const parsed = JSON.parse(res.content[0].text);
+    expect(parsed.error.code).toBe('DISCONNECTED');
+  });
+
+  it('maps unparseable JSON between markers to PARSE_ERROR', async () => {
+    executeOp.mockResolvedValue({
+      stdout: 'GET_SCENE_TREE_JSON_START\n{broken json\nGET_SCENE_TREE_JSON_END',
+      stderr: '',
+    });
+    const res = await server.handleGetSceneTree({ projectPath, scenePath: 'main.tscn' });
+    const parsed = JSON.parse(res.content[0].text);
+    expect(parsed.error.code).toBe('PARSE_ERROR');
+  });
+
+  it('short-circuits to NO_SCENE before connecting when the scene file is absent', async () => {
+    executeOp.mockClear();
+    const res = await server.handleGetSceneTree({ projectPath, scenePath: 'missing.tscn' });
+    expect(executeOp).not.toHaveBeenCalled();
+    const parsed = JSON.parse(res.content[0].text);
+    expect(parsed.error.code).toBe('NO_SCENE');
+  });
+
+  it('returns INVALID_PARAMS when required arguments are missing', async () => {
+    executeOp.mockClear();
+    const res = await server.handleGetSceneTree({ projectPath });
+    expect(executeOp).not.toHaveBeenCalled();
+    const parsed = JSON.parse(res.content[0].text);
+    expect(parsed.error.code).toBe('INVALID_PARAMS');
+  });
+
+  it('aligns tool definition name, dispatch case, handler method and GDScript operation', () => {
+    expect(sourceCode).toContain("name: 'get_scene_tree'");
+    expect(sourceCode).toContain("case 'get_scene_tree':");
+    expect(sourceCode).toContain('return await this.handleGetSceneTree(');
+    expect(sourceCode).toContain('private async handleGetSceneTree(');
+    expect(gdSource).toContain('"get_scene_tree":');
+    expect(gdSource).toContain('func get_scene_tree(');
+    // Markers and nodes draw from one shared budget on the engine side.
+    expect(gdSource).toContain('GET_SCENE_TREE_MARKER');
+    expect(gdSource).toContain('_get_scene_tree_reserve');
   });
 });

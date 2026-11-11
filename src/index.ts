@@ -1384,6 +1384,32 @@ export class GodotServer {
           },
         },
         {
+          name: 'get_scene_tree',
+          description: 'Read bounded scene tree with shared depth/node budget',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Godot project path',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Scene file path (relative to project)',
+              },
+              maxDepth: {
+                type: 'number',
+                description: 'Maximum node depth from the root (root = 0). Default 32.',
+              },
+              maxNodes: {
+                type: 'number',
+                description: 'Shared output budget: real nodes plus truncation markers. Default 1000.',
+              },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
           name: 'modify_scene_node',
           description: 'Modify node properties in a scene file (headless)',
           inputSchema: {
@@ -3394,6 +3420,8 @@ export class GodotServer {
         // Headless scene tools
         case 'read_scene':
           return await this.handleReadScene(request.params.arguments);
+        case 'get_scene_tree':
+          return await this.handleGetSceneTree(request.params.arguments);
         case 'modify_scene_node':
           return await this.handleModifySceneNode(request.params.arguments);
         case 'remove_scene_node':
@@ -4787,6 +4815,83 @@ export class GodotServer {
     } catch (error: any) {
       return createErrorResponse(`Failed to read scene: ${error?.message || 'Unknown error'}`);
     }
+  }
+
+  /**
+   * Handle the get_scene_tree tool - bounded scene tree read (headless).
+   *
+   * The GDScript side always answers with a structured envelope
+   * { success, data | error }. A missing scene, a plugin/transport disconnect
+   * (spawn/socket failure) and a JSON parse failure are all folded into the
+   * same envelope shape here, so the handler always returns and never throws
+   * outward.
+   */
+  private async handleGetSceneTree(args: any) {
+    args = normalizeParameters(args || {});
+    if (!args.projectPath || !args.scenePath) {
+      return this.sceneTreeEnvelope(
+        this.sceneTreeError('INVALID_PARAMS', 'projectPath and scenePath are required.'));
+    }
+    if (!validatePath(args.projectPath) || !validatePath(args.scenePath)) {
+      return this.sceneTreeEnvelope(this.sceneTreeError('INVALID_PATH', 'Invalid path.'));
+    }
+
+    const projectFile = join(args.projectPath, 'project.godot');
+    if (!existsSync(projectFile)) {
+      return this.sceneTreeEnvelope(
+        this.sceneTreeError('NO_PROJECT', `Not a valid Godot project: ${args.projectPath}`));
+    }
+    const scenePath = join(args.projectPath, args.scenePath);
+    if (!existsSync(scenePath)) {
+      return this.sceneTreeEnvelope(
+        this.sceneTreeError('NO_SCENE', `Scene file does not exist: ${args.scenePath}`));
+    }
+
+    const opParams: OperationParams = { scenePath: args.scenePath };
+    if (args.maxDepth !== undefined) opParams.maxDepth = args.maxDepth;
+    if (args.maxNodes !== undefined) opParams.maxNodes = args.maxNodes;
+
+    let stdout = '';
+    try {
+      const result = await this.executeOperation('get_scene_tree', opParams, args.projectPath);
+      stdout = result.stdout || '';
+    } catch (error: any) {
+      // Plugin/transport disconnect or engine spawn failure.
+      return this.sceneTreeEnvelope(
+        this.sceneTreeError('DISCONNECTED', `Godot connection failed: ${error?.message || 'Unknown error'}`));
+    }
+
+    const startMarker = 'GET_SCENE_TREE_JSON_START';
+    const endMarker = 'GET_SCENE_TREE_JSON_END';
+    const startIdx = stdout.indexOf(startMarker);
+    const endIdx = stdout.indexOf(endMarker);
+    if (startIdx === -1 || endIdx === -1) {
+      return this.sceneTreeEnvelope(
+        this.sceneTreeError('DISCONNECTED', 'No get_scene_tree response from Godot (plugin disconnected or no output).'));
+    }
+
+    const jsonStr = stdout.substring(startIdx + startMarker.length, endIdx).trim();
+    try {
+      return this.sceneTreeEnvelope(JSON.parse(jsonStr));
+    } catch (error: any) {
+      return this.sceneTreeEnvelope(
+        this.sceneTreeError('PARSE_ERROR', `Failed to parse get_scene_tree JSON: ${error?.message || 'Unknown error'}`));
+    }
+  }
+
+  private sceneTreeError(code: string, message: string): any {
+    return {
+      success: false,
+      error: { code, message },
+      data: null,
+    };
+  }
+
+  private sceneTreeEnvelope(envelope: any): any {
+    return {
+      content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }],
+      isError: envelope?.success === false,
+    };
   }
 
   /**
